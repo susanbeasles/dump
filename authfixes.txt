@@ -1,0 +1,512 @@
+AuthStore
+
+import * as SecureStore from 'expo-secure-store';
+
+const ACCESS_TOKEN_KEY = 'accessToken';
+const REFRESH_TOKEN_KEY = 'refreshToken';
+
+let accessToken: string | null = null;
+let refreshToken: string | null = null;
+
+export async function loadTokens(): Promise<void> {
+  accessToken = await SecureStore.getItemAsync(ACCESS_TOKEN_KEY);
+  refreshToken = await SecureStore.getItemAsync(REFRESH_TOKEN_KEY);
+}
+
+export function getAccessToken(): string | null {
+  return accessToken;
+}
+
+export function getRefreshToken(): string | null {
+  return refreshToken;
+}
+
+export async function setTokens(
+  nextAccessToken: string,
+  nextRefreshToken: string
+): Promise<void> {
+  accessToken = nextAccessToken;
+  refreshToken = nextRefreshToken;
+
+  await Promise.all([
+    SecureStore.setItemAsync(ACCESS_TOKEN_KEY, nextAccessToken),
+    SecureStore.setItemAsync(REFRESH_TOKEN_KEY, nextRefreshToken),
+  ]);
+}
+
+export async function clearTokens(): Promise<void> {
+  accessToken = null;
+  refreshToken = null;
+
+  await Promise.allSettled([
+    SecureStore.deleteItemAsync(ACCESS_TOKEN_KEY),
+    SecureStore.deleteItemAsync(REFRESH_TOKEN_KEY),
+  ]);
+}
+
+AuthClient
+
+import axios from 'axios';
+
+const authApi = axios.create({
+  baseURL: process.env.EXPO_PUBLIC_API_URL,
+});
+
+export type AuthTokens = {
+  accessToken: string;
+  refreshToken: string;
+};
+
+export type LoginRequest = {
+  email: string;
+  password: string;
+};
+
+export async function login(
+  credentials: LoginRequest
+): Promise<AuthTokens> {
+  const response = await authApi.post<AuthTokens>(
+    '/api/v1/patient/login',
+    credentials
+  );
+
+  return response.data;
+}
+
+export async function refresh(
+  refreshToken: string
+): Promise<AuthTokens> {
+  const response = await authApi.post<AuthTokens>(
+    '/api/v1/patient/refresh',
+    {
+      refreshToken,
+    }
+  );
+
+  return response.data;
+}
+
+AuthInterceptor
+
+import {
+  AxiosError,
+  AxiosInstance,
+  InternalAxiosRequestConfig,
+} from 'axios';
+import { jwtDecode } from 'jwt-decode';
+
+import * as AuthClient from './authClient';
+import * as AuthStore from './authStore';
+
+const REFRESH_WINDOW_MS = 30_000;
+
+type RetryRequest = InternalAxiosRequestConfig & {
+  _retry?: boolean;
+};
+
+let refreshPromise: Promise<string> | null = null;
+
+function tokenExpiresSoon(token: string): boolean {
+  try {
+    const decoded = jwtDecode<{ exp?: number }>(token);
+
+    if (!decoded.exp) {
+      return true;
+    }
+
+    const expiresAt = decoded.exp * 1000;
+
+    return expiresAt - Date.now() <= REFRESH_WINDOW_MS;
+  } catch {
+    return true;
+  }
+}
+
+async function performRefresh(): Promise<string> {
+  const refreshToken = AuthStore.getRefreshToken();
+
+  if (!refreshToken) {
+    await AuthStore.clearTokens();
+    throw new Error('Missing refresh token');
+  }
+
+  try {
+    const tokens = await AuthClient.refresh(refreshToken);
+
+    await AuthStore.setTokens(
+      tokens.accessToken,
+      tokens.refreshToken
+    );
+
+    return tokens.accessToken;
+  } catch (error) {
+    const status = (error as AxiosError).response?.status;
+
+    if (status === 401) {
+      await AuthStore.clearTokens();
+    }
+
+    throw error;
+  }
+}
+
+async function refreshAccessToken(): Promise<string> {
+  if (refreshPromise) {
+    return refreshPromise;
+  }
+
+  refreshPromise = performRefresh();
+
+  try {
+    return await refreshPromise;
+  } finally {
+    refreshPromise = null;
+  }
+}
+
+async function handleRequest(
+  request: InternalAxiosRequestConfig
+): Promise<InternalAxiosRequestConfig> {
+  let accessToken = AuthStore.getAccessToken();
+
+  if (!accessToken) {
+    return request;
+  }
+
+  if (tokenExpiresSoon(accessToken)) {
+    accessToken = await refreshAccessToken();
+  }
+
+  request.headers.Authorization = `Bearer ${accessToken}`;
+
+  return request;
+}
+
+function installResponseInterceptor(api: AxiosInstance): void {
+  api.interceptors.response.use(
+    response => response,
+    async error => {
+      const request = error.config as RetryRequest | undefined;
+
+      if (
+        error.response?.status !== 401 ||
+        !request ||
+        request._retry
+      ) {
+        throw error;
+      }
+
+      request._retry = true;
+
+      try {
+        const accessToken = await refreshAccessToken();
+
+        request.headers.Authorization =
+          `Bearer ${accessToken}`;
+
+        return api(request);
+      } catch {
+        throw error;
+      }
+    }
+  );
+}
+
+export function installAuthInterceptor(
+  api: AxiosInstance
+): void {
+  api.interceptors.request.use(handleRequest);
+
+  installResponseInterceptor(api);
+}
+
+routing/deeplinks.ts
+
+import { Href, Router } from 'expo-router';
+
+export type NotificationData = {
+  redirectTo?: string;
+};
+
+export function getRedirectTo(
+  data?: NotificationData
+): Href {
+  if (!data?.redirectTo) {
+    return '/homeFeed';
+  }
+
+  if (!data.redirectTo.startsWith('/')) {
+    return `/${data.redirectTo}` as Href;
+  }
+
+  return data.redirectTo as Href;
+}
+
+export function openDeepLink(
+  router: Router,
+  data?: NotificationData
+): void {
+  router.push(getRedirectTo(data));
+}
+
+Routing Usage
+
+import { Href, Router } from 'expo-router';
+
+const DEFAULT_ROUTE: Href = '/homeFeed';
+
+export function redirectToLogin(
+  router: Router,
+  continueTo?: string
+): void {
+  router.replace({
+    pathname: '/(auth)/login',
+    params: {
+      continueTo: continueTo || DEFAULT_ROUTE,
+    },
+  });
+}
+
+export function continueAfterLogin(
+  router: Router,
+  continueTo?: string
+): void {
+  router.replace(
+    (continueTo || DEFAULT_ROUTE) as Href
+  );
+}
+
+Login Fail Usage
+
+import { useLocalSearchParams, useRouter } from 'expo-router';
+
+import * as AuthClient from '@/auth/authClient';
+import * as AuthStore from '@/auth/authStore';
+import { continueAfterLogin } from '@/routing/authRedirect';
+
+export default function LoginScreen() {
+  const router = useRouter();
+
+  const { continueTo } = useLocalSearchParams<{
+    continueTo?: string;
+  }>();
+
+  async function handleLogin(
+    email: string,
+    password: string
+  ): Promise<void> {
+    const tokens = await AuthClient.login({
+      email,
+      password,
+    });
+
+    await AuthStore.setTokens(
+      tokens.accessToken,
+      tokens.refreshToken
+    );
+
+    continueAfterLogin(router, continueTo);
+  }
+
+  // existing UI
+}
+
+Auuthenticated Failed Route
+
+import { usePathname, useRouter } from 'expo-router';
+
+import { redirectToLogin } from '@/routing/authRedirect';
+
+const router = useRouter();
+const pathname = usePathname();
+
+try {
+  await loadSurvey();
+} catch (error) {
+  if (error.response?.status === 401) {
+    redirectToLogin(router, pathname);
+    return;
+  }
+
+  throw error;
+}
+
+Push Notifications
+
+import { useRouter } from 'expo-router';
+
+import { openDeepLink } from '@/routing/deepLinks';
+
+const router = useRouter();
+
+function handleNotificationPress(data: {
+  redirectTo?: string;
+}): void {
+  openDeepLink(router, data);
+}
+
+App Initialization
+
+import axios from 'axios';
+
+import { loadTokens } from '@/auth/authStore';
+import { installAuthInterceptor } from '@/auth/authInterceptor';
+
+export const api = axios.create({
+  baseURL: process.env.EXPO_PUBLIC_API_URL,
+});
+
+export async function initializeApp(): Promise<void> {
+  await loadTokens();
+
+  installAuthInterceptor(api);
+}
+
+async function handleResponseError(
+  error: AxiosError
+): Promise<unknown> {
+  const request = error.config as RetryRequest | undefined;
+
+  if (
+    error.response?.status !== 401 ||
+    !request ||
+    request._retry
+  ) {
+    throw error;
+  }
+
+  request._retry = true;
+
+  try {
+    const accessToken = await refreshAccessToken();
+
+    request.headers.Authorization =
+      `Bearer ${accessToken}`;
+
+    return api(request);
+  } catch {
+    throw error;
+  }
+}
+
+async function performRefresh(): Promise<string> {
+  const refreshToken = AuthStore.getRefreshToken();
+
+  if (!refreshToken) {
+    await AuthStore.clearTokens();
+    throw new Error('Missing refresh token');
+  }
+
+  try {
+    const tokens = await AuthClient.refresh(refreshToken);
+
+    await AuthStore.setTokens(
+      tokens.accessToken,
+      tokens.refreshToken
+    );
+
+    return tokens.accessToken;
+  } catch (error) {
+    if ((error as AxiosError).response?.status === 401) {
+      await AuthStore.clearTokens();
+    }
+
+    throw error;
+  }
+}
+
+Then the deep-link case becomes default functionality.
+
+Notification:
+
+{
+  redirectTo: '/survey/123'
+}
+
+Expo Router opens:
+
+/survey/123
+
+That belongs underneath (app).
+
+Its shared layout performs the normal protected bootstrap request.
+
+Interceptor proactively refreshes.
+
+If refresh works:
+
+/survey/123
+
+just loads.
+
+If refresh returns 401:
+
+/login?continueTo=/survey/123
+
+Then successful login:
+
+const { continueTo } = useLocalSearchParams<{
+  continueTo?: string;
+}>();
+
+const tokens = await AuthClient.login(credentials);
+
+await AuthStore.setTokens(
+  tokens.accessToken,
+  tokens.refreshToken
+);
+
+router.replace(
+  (continueTo || '/homeFeed') as Href
+);
+
+use React Query's global error handling, not another homegrown auth event bus.
+
+For example, configure one global QueryCache:
+
+import { QueryCache, QueryClient } from '@tanstack/react-query';
+import { AxiosError } from 'axios';
+
+
+export const queryClient = new QueryClient({
+  queryCache: new QueryCache({
+    onError(error) {
+      if ((error as AxiosError).response?.status === 401) {
+        // let the protected route boundary handle unauthorized
+      }
+    },
+  }),
+});
+
+very protected route group loads some tiny backend endpoint such as:
+
+GET /api/v1/me
+
+import { Redirect, Slot, usePathname } from 'expo-router';
+
+import { useCurrentPatient } from '@/queries/useCurrentPatient';
+
+export default function ProtectedLayout() {
+  const pathname = usePathname();
+
+  const { error, isLoading } = useCurrentPatient();
+
+  if (isLoading) {
+    return null;
+  }
+
+  if (error?.response?.status === 401) {
+    return (
+      <Redirect
+        href={{
+          pathname: '/(auth)/login',
+          params: {
+            continueTo: pathname,
+          },
+        }}
+      />
+    );
+  }
+
+  return <Slot />;
+}
